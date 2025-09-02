@@ -35,8 +35,7 @@ class CavityModeHelper:
     L : float
         Cylinder length.
     c : float, optional
-        Speed of light factor for unit systems where you want it explicit.
-        Only appears as a multiplier in TE amplitudes here; set c=1 for natural units.
+        Speed of light.
     """
     a: float
     L: float
