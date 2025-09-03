@@ -1,19 +1,16 @@
 from __future__ import annotations
+__all__ = ["CavityModeHelper"]
+
+from typing import Callable, Literal, Tuple
+Family = Literal["TE", "TM"]
+Sign = Literal["+", "-"]
 
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Callable, Literal, Tuple
 
+from bessel import initialize_bessel_table, BesselJZeros, BesselJpZeros
 import numpy as np
 from scipy.special import jv, jvp
-
-# Your bessel helper provides these; initialize once if you like.
-from bessel import initialize_bessel_table, BesselJZeros, BesselJpZeros
-
-__all__ = ["CavityModeHelper"]
-
-Family = Literal["TE", "TM"]
-Sign = Literal["+", "-"]
 
 def _asarray_f64(x):
     return np.asarray(x, dtype=float)
@@ -54,17 +51,16 @@ class CavityModeHelper:
         return p * np.pi / L
 
     @lru_cache(maxsize=None)
-    def _gamma(self, family: Family, m: int, n: int) -> float:
-        fam = family.upper()
+    def _gamma(self, family:Family, m: int, n: int) -> float:
         if not (isinstance(m, int) and isinstance(n, int)):
             raise ValueError("m and n must be integers")
         if m < 0 or n <= 0:
             raise ValueError("m >= 0 and n > 0 are required")
-
+        fam = family.upper()
         if fam == "TM":
-            return float(BesselJZeros(m, n) / self.a)
+            return float(BesselJZeros(m,n) / self.a)
         elif fam == "TE":
-            return float(BesselJpZeros(m, n) / self.a)
+            return float(BesselJpZeros(m,n) / self.a)
         else:
             raise ValueError("family must be 'TE' or 'TM'")
 
@@ -86,7 +82,7 @@ class CavityModeHelper:
         if sign not in {"+", "-"}:
             raise ValueError("sign must be '+' or '-'")
 
-        g = self._gamma(fam, m, n)
+        g = self._gamma(family, m, n)
         kz = self._kz(p, self.L)
         w = self._omega(g, kz)
 
@@ -127,21 +123,7 @@ class CavityModeHelper:
 
         return Er_TE, Ephi_TE, Ez_TE
 
-    # wrappers for individual components
-    def Er_TM_fn(self, m: int, n: int, p: int, sign: Sign = "+") -> Callable:
-        return self.mode_functions("TM", m, n, p, sign)[0]
-
-    def Ephi_TM_fn(self, m: int, n: int, p: int, sign: Sign = "+") -> Callable:
-        return self.mode_functions("TM", m, n, p, sign)[1]
-
-    def Ez_TM_fn(self, m: int, n: int, p: int, sign: Sign = "+") -> Callable:
-        return self.mode_functions("TM", m, n, p, sign)[2]
-
-    def Er_TE_fn(self, m: int, n: int, p: int, sign: Sign = "+") -> Callable:
-        return self.mode_functions("TE", m, n, p, sign)[0]
-
-    def Ephi_TE_fn(self, m: int, n: int, p: int, sign: Sign = "+") -> Callable:
-        return self.mode_functions("TE", m, n, p, sign)[1]
-
-    def Ez_TE_fn(self, m: int, n: int, p: int, sign: Sign = "+") -> Callable:
-        return self.mode_functions("TE", m, n, p, sign)[2]
+    def omega_mnp(self, family: Family, m: int, n: int, p: int) -> float:
+        g = self._gamma(family, m, n)
+        kz = self._kz(p, self.L)
+        return self._omega(g, kz)
