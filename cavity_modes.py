@@ -1,23 +1,18 @@
 from __future__ import annotations
 __all__ = ["CavityModeHelper"]
 
-from typing import Callable, Literal, Tuple
-Family = Literal["TE", "TM"]
-Sign = Literal["+", "-"]
+from custom_types import *
 
 from dataclasses import dataclass
 from functools import lru_cache
 
-from bessel import initialize_bessel_table, BesselJZeros, BesselJpZeros
+from bessel import BesselJZeros, BesselJpZeros
 import numpy as np
 from scipy.special import jv, jvp
 
-def _asarray_f64(x):
-    return np.asarray(x, dtype=float)
-
-def _m_over_r_Jm(m: int, gamma: float, r) -> np.ndarray:
+def _m_over_r_Jm(m: int, gamma: float, r) -> NDArray:
     """Safe m/r with no 1/r singularity, using the Bessel identity."""
-    r = _asarray_f64(r)
+    r = asarr_f64(r)
     return 0.5 * gamma * (jv(m - 1, gamma * r) + jv(m + 1, gamma * r))
 
 @dataclass(frozen=True)
@@ -45,34 +40,33 @@ class CavityModeHelper:
     # -------- core dispersion helpers --------
 
     @staticmethod
-    def _kz(p: int, L: float) -> float:
+    def _kz(p: int, L: float) -> f64:
         if not (isinstance(p, int) and p >= 0):
             raise ValueError("p must be an integer >= 0")
-        return p * np.pi / L
+        return f64(p * np.pi / L)
 
     @lru_cache(maxsize=None)
-    def _gamma(self, family:Family, m: int, n: int) -> float:
+    def _gamma(self, family:Family, m: int, n: int) -> f64:
         if not (isinstance(m, int) and isinstance(n, int)):
             raise ValueError("m and n must be integers")
         if m < 0 or n <= 0:
             raise ValueError("m >= 0 and n > 0 are required")
         fam = family.upper()
         if fam == "TM":
-            return float(BesselJZeros(m,n) / self.a)
+            return f64(BesselJZeros(m,n) / self.a)
         elif fam == "TE":
-            return float(BesselJpZeros(m,n) / self.a)
+            return f64(BesselJpZeros(m,n) / self.a)
         else:
             raise ValueError("family must be 'TE' or 'TM'")
 
     @staticmethod
-    def _omega(gamma: float, kz: float) -> float:
-        return float(np.sqrt(gamma * gamma + kz * kz))
+    def _omega(gamma: float, kz: float) -> f64:
+        return f64(np.sqrt(gamma * gamma + kz * kz))
 
     # -------- public API --------
 
-    def mode_functions(
-        self, family: Family, m: int, n: int, p: int, sign: Sign = "+"
-    ) -> Tuple[Callable, Callable, Callable]:
+    def mode_fn_callables(
+        self, family: Family, m: int, n: int, p: int, sign: Sign = "+") -> Triple:
         """
         Return callables (Er, Ephi, Ez) for the requested (family, m, n, p).
 
@@ -88,17 +82,17 @@ class CavityModeHelper:
 
         if fam == "TM":
             def Er_TM(r, phi, z):
-                r, phi, z = _asarray_f64(r), _asarray_f64(phi), _asarray_f64(z)
+                r, phi, z = asarr_f64(r), asarr_f64(phi), asarr_f64(z)
                 ang = np.sin(m * phi) if sign == "+" else np.cos(m * phi)
                 return -(kz / g) * ang * np.sin(kz * z) * jvp(m, g * r)
 
             def Ephi_TM(r, phi, z):
-                r, phi, z = _asarray_f64(r), _asarray_f64(phi), _asarray_f64(z)
+                r, phi, z = asarr_f64(r), asarr_f64(phi), asarr_f64(z)
                 ang = np.cos(m * phi) if sign == "+" else -np.sin(m * phi)
                 return -(kz / (g * g)) * ang * np.sin(kz * z) * _m_over_r_Jm(m, g, r)
 
             def Ez_TM(r, phi, z):
-                r, phi, z = _asarray_f64(r), _asarray_f64(phi), _asarray_f64(z)
+                r, phi, z = asarr_f64(r), asarr_f64(phi), asarr_f64(z)
                 ang = np.sin(m * phi) if sign == "+" else np.cos(m * phi)
                 return ang * np.cos(kz * z) * jv(m, g * r)
 
@@ -106,24 +100,62 @@ class CavityModeHelper:
 
         # TE family
         def Er_TE(r, phi, z):
-            r, phi, z = _asarray_f64(r), _asarray_f64(phi), _asarray_f64(z)
+            r, phi, z = asarr_f64(r), asarr_f64(phi), asarr_f64(z)
             ang = np.cos(m * phi) if sign == "+" else -np.sin(m * phi)
-            # include self.c for unit bookkeeping if desired
             return 1j * (self.c * w) / (g * g) * ang * np.sin(kz * z) * _m_over_r_Jm(m, g, r)
 
         def Ephi_TE(r, phi, z):
-            r, phi, z = _asarray_f64(r), _asarray_f64(phi), _asarray_f64(z)
+            r, phi, z = asarr_f64(r), asarr_f64(phi), asarr_f64(z)
             ang = np.sin(m * phi) if sign == "+" else np.cos(m * phi)
             return -1j * (self.c * w) / g * ang * np.sin(kz * z) * jvp(m, g * r)
 
         def Ez_TE(r, phi, z):
-            r = _asarray_f64(r)
-            # TE has Ez = 0 in this convention
+            r = asarr_f64(r)
             return np.zeros_like(r)
 
         return Er_TE, Ephi_TE, Ez_TE
 
-    def omega_mnp(self, family: Family, m: int, n: int, p: int) -> float:
+    def mode_fn_vectorized(self, R, PHI, Z, family: Family, 
+                           m: int, n: int, p: int, sign: Sign) -> TripleV:
+        """
+        Return vectorized (Er, Ephi, Ez) arrays for the requested (family, m, n, p).
+        R, PHI, Z are assumed to be generated by np.meshgrid with indexing="ij".
+        """
+        fam = family.upper()
+        if sign not in {"+", "-"}:
+            raise ValueError("sign must be '+' or '-'")
+
+        g = self._gamma(family, m, n)
+        kz = self._kz(p, self.L)
+        w = self._omega(g, kz)
+
+        kz_g, kz_g2 = kz/g, kz/(g*g)
+        w_g2 = self.c * w / (g*g)
+
+        smp = np.sin(m*PHI)
+        cmp = np.cos(m*PHI)
+        s_kz_z = np.sin(kz*Z)
+        c_kz_z = np.cos(kz*Z)
+
+        Jm = jv(m, g*R)
+        Jm_p = jvp(m, g*R)
+        m_over_r_Jm = _m_over_r_Jm(m, g, R)
+
+        if fam == "TM":
+            Er_TM = -kz_g * (smp if sign == "+" else cmp) * s_kz_z * Jm_p
+            Ephi_TM = -kz_g2 * (cmp if sign == "+" else -smp) * s_kz_z * m_over_r_Jm
+            Ez_TM = (smp if sign == "+" else cmp) * c_kz_z * Jm
+            return asarr_c128(Er_TM), asarr_c128(Ephi_TM), asarr_c128(Ez_TM)
+        else:   # TE
+            Er_TE = 1j * w_g2 * (cmp if sign == "+" else -smp) * s_kz_z * m_over_r_Jm
+            Ephi_TE = -1j * self.c * w / g * (smp if sign == "+" else cmp) * s_kz_z * Jm_p
+            Ez_TE = np.zeros_like(Er_TE, dtype=c128)
+            return asarr_c128(Er_TE), asarr_c128(Ephi_TE), asarr_c128(Ez_TE)
+
+    def omega_mnp(self, family: Family, m: int, n: int, p: int) -> f64:
+        """
+        Return the eigenfrequency ω_mnp for the given (family, m, n, p).
+        """
         g = self._gamma(family, m, n)
         kz = self._kz(p, self.L)
         return self._omega(g, kz)

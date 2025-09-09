@@ -1,44 +1,149 @@
 from __future__ import annotations
-import numpy as np
-from typing import Callable, Literal, Tuple
-
 __all__ = [
-    "j_eff"
+    "j_eff_callables",
+    "j_eff_vectorized",
 ]
 
-Polarization = Literal["+", "x"]
+from custom_types import *
+import numpy as np
 
-def _asarray_f64(x):
-    return np.asarray(x, dtype=float)
+def f(x) -> NDArray:
+    x = asarr_c128(x)
+    return -3 - 6j/x - 12*np.exp(-1j*x)/x**2 - 12j*(1 - np.exp(-1j*x))/x**3
 
-def f(x) -> float:
-    return -3 - 6*1j/x - 12*np.exp(-1j*x)/(x**2) - 12*1j*(1-np.exp(-1j*x))/(x**3)
+def f_stable(x, thresh=1e-4):
+    """
+    Numerically stable version of
 
-def j_eff(pol:Polarization, wg:float) -> Tuple[Callable, Callable, Callable]:
-    if pol == "+":  # plus polarization
+        f(x) = -3 - 6j/x - 12*exp(-1j*x)/x**2 - 12j*(1-exp(-1j*x))/x**3
+
+    Handles x=0 and small |x| safely.
+    """
+    x = np.asarray(x, dtype=f64)
+    z = x.astype(np.complex128)
+
+    out = np.empty_like(z)
+
+    small = np.abs(x) < thresh
+    large = ~small
+
+    # --- small-x: use Maclaurin series
+    xs = z[small]
+    if xs.size:
+        xs2 = xs*xs
+        out[small] = (
+            1
+            + (-1.5j)*xs
+            + (-2/5)*xs2
+            + (1j/12)*xs*xs2
+            + (1/70)*xs2*xs2
+            + (-1j/480)*xs2*xs2*xs
+            + (-1/3780)*xs2*xs2*xs2
+        )
+
+    # --- regular branch: use expm1 for accuracy ---
+    xl = z[large]
+    if xl.size:
+        y = np.exp(-1j*xl)
+        em1 = np.expm1(-1j*xl)      # = e^{-ix}-1
+        out[large] = (
+            -3
+            - 6j/xl
+            - 12*y/(xl*xl)
+            - 12j*(-em1)/(xl*xl*xl)  # 1 - e^{-ix} = -expm1(-ix)
+        )
+
+    return out
+
+def j_eff_callables(pol:Polarization, wg:float, beta, alpha, psi=0.0) -> TripleC:
+    """
+    Get (Jr,Jphi,Jz) callables for off-axis GW incidence. Used solely by old plotting code.
+    """
+    one_plus_cb_over_2_sq = (0.5*(1+np.cos(beta)))**2
+    one_minus_cb_over_2_sq = (0.5*(1-np.cos(beta)))**2
+    sb, cb = np.sin(beta), np.cos(beta)
+
+    def Jz(r, phi, z):
+            z = asarr_f64(z)
+            return np.zeros_like(z, dtype=c128)
+
+    if pol in ["plus", "+"]:  # plus polarization
         def Jr_plus(r, phi, z):
-            r, phi, z = _asarray_f64(r), _asarray_f64(phi), _asarray_f64(z)
-            fwz = f(wg*z)
-            return fwz * np.sin(2*phi) * r
+            r, phi, z = asarr_f64(r), asarr_f64(phi), asarr_f64(z)
+            s_a_plus_psi_phi = np.sin(2*(alpha+psi+phi))
+            s_a_minus_psi_phi = np.sin(2*(alpha-psi-phi))
+            s = r*sb*np.cos(phi-alpha)+z*cb
+            return -f(wg*s) * r * (-s_a_plus_psi_phi*one_plus_cb_over_2_sq + s_a_minus_psi_phi*one_minus_cb_over_2_sq)
         def Jphi_plus(r, phi, z):
-            r, phi, z = _asarray_f64(r), _asarray_f64(phi), _asarray_f64(z)
-            fwz = f(wg*z)
-            return fwz * np.cos(2*phi) * r
-        def Jz_plus(r, phi, z):
-            z = _asarray_f64(z)
-            return np.zeros_like(z, dtype=complex)
-        return Jr_plus, Jphi_plus, Jz_plus
+            r, phi, z = asarr_f64(r), asarr_f64(phi), asarr_f64(z)
+            c_a_plus_psi_phi = np.cos(2*(alpha+psi+phi))
+            c_a_minus_psi_phi = np.cos(2*(alpha-psi-phi))
+            s = r*sb*np.cos(phi-alpha)+z*cb
+            return -f(wg*s) * r * (-c_a_plus_psi_phi*one_plus_cb_over_2_sq - c_a_minus_psi_phi*one_minus_cb_over_2_sq)
+        return Jr_plus, Jphi_plus, Jz
     
-    else:  # cross polarization
+    else:   # cross polarization
         def Jr_cross(r, phi, z):
-            r, phi, z = _asarray_f64(r), _asarray_f64(phi), _asarray_f64(z)
-            fwz = f(wg*z)
-            return -fwz * np.cos(2*phi) * r
+            r, phi, z = asarr_f64(r), asarr_f64(phi), asarr_f64(z)
+            c_a_plus_psi_phi = np.cos(2*(alpha+psi+phi))
+            c_a_minus_psi_phi = np.cos(2*(alpha-psi-phi))
+            s = r*sb*np.cos(phi-alpha)+z*cb
+            return -f(wg*s) * r * (-c_a_plus_psi_phi*one_plus_cb_over_2_sq - c_a_minus_psi_phi*one_minus_cb_over_2_sq)
         def Jphi_cross(r, phi, z):
-            r, phi, z = _asarray_f64(r), _asarray_f64(phi), _asarray_f64(z)
-            fwz = f(wg*z)
-            return -fwz * np.sin(2*phi) * r
-        def Jz_cross(r, phi, z):
-            z = _asarray_f64(z)
-            return np.zeros_like(z, dtype=complex)
-        return Jr_cross, Jphi_cross, Jz_cross
+            r, phi, z = asarr_f64(r), asarr_f64(phi), asarr_f64(z)
+            s_a_plus_psi_phi = np.sin(2*(alpha+psi+phi))
+            s_a_minus_psi_phi = np.sin(2*(alpha-psi-phi))
+            s = r*sb*np.cos(phi-alpha)+z*cb
+            return -f(wg*s) * r * (-s_a_plus_psi_phi*one_plus_cb_over_2_sq - s_a_minus_psi_phi*one_minus_cb_over_2_sq)
+        return Jr_cross, Jphi_cross, Jz
+
+def j_eff_vectorized(R, PHI, Z, BETA, ALPHA, PSI, *, pol: Polarization, wg: float) -> TripleV:
+    """
+    Vectorized j_eff for off-axis GW incidence.
+
+    Parameters
+    ----------
+    R, PHI, Z : arrays
+        Cylindrical coords with possible trailing broadcast dims. Assumed to be
+        generated by np.meshgrid with indexing="ij", and then broadcast with 
+        BETA, ALPHA, PSI.
+    BETA, ALPHA, PSI : arrays
+        Angle arrays, broadcastable to R/PHI/Z.
+    pol : {'+','plus','x','cross'}
+    wg : f64
+        GW frequency used inside f(wg*s).
+
+    Returns
+    -------
+    jr, jphi, jz : complex ndarrays
+        Shape broadcast of (R,PHI,Z,BETA,ALPHA,PSI)
+    """
+    sb = np.sin(BETA)
+    cb = np.cos(BETA)
+
+    A_plus  = 2.0 * (ALPHA + PSI + PHI)
+    A_minus = 2.0 * (ALPHA - PSI - PHI)
+    s_a_plus_psi_phi  = np.sin(A_plus)
+    s_a_minus_psi_phi = np.sin(A_minus)
+    c_a_plus_psi_phi  = np.cos(A_plus)
+    c_a_minus_psi_phi = np.cos(A_minus)
+
+    one_plus_cb_over_2_sq  = (0.5 * (1.0 + cb))**2
+    one_minus_cb_over_2_sq = (0.5 * (1.0 - cb))**2
+
+    s = R * sb * np.cos(PHI - ALPHA) + Z * cb
+    F = f(wg * s).astype(c128, copy=False)
+
+    if pol == '+':
+        jr   = -F * R * ( -s_a_plus_psi_phi * one_plus_cb_over_2_sq
+                          + s_a_minus_psi_phi * one_minus_cb_over_2_sq )
+        jphi = -F * R * ( -c_a_plus_psi_phi * one_plus_cb_over_2_sq
+                          - c_a_minus_psi_phi * one_minus_cb_over_2_sq )
+    else:
+        jr   = -F * R * ( -c_a_plus_psi_phi * one_plus_cb_over_2_sq
+                          - c_a_minus_psi_phi * one_minus_cb_over_2_sq )
+        jphi = -F * R * ( -s_a_plus_psi_phi * one_plus_cb_over_2_sq
+                          - s_a_minus_psi_phi * one_minus_cb_over_2_sq )
+
+    jz = np.zeros_like(F, dtype=c128)
+    return jr, jphi, jz
