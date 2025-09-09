@@ -1,6 +1,6 @@
 from __future__ import annotations
-__all__ = ["Polarization", "Family", "Sign", "Triple", "c128", "f64", "NDArray", "ArrayLike",
-           "asarr_f64", "asarr_c128"]
+__all__ = ["Polarization", "Family", "Sign", "Triple", "TripleC", "TripleV", 
+           "c128", "f64", "NDArray", "ArrayLike", "asarr_f64", "asarr_c128"]
 
 from typing import Callable, Literal, Tuple
 from numpy.typing import NDArray, ArrayLike
