@@ -1,30 +1,31 @@
 """
 Routine for computing 6D effective current (j_eff) grids
 from pickled SymPy expressions using spatial-grid chunking 
-for CPU cache efficiency and process-level parallelism to 
-compute components concurrently.
+for CPU cache efficiency.
+
+This version is single-threaded and computes all 6 components serially.
 """
 
 from __future__ import annotations
 __all__ = ["compute_j_eff_6d"]
 import numpy as np
-from custom_types import *
+from .custom_types import *
 import pickle
 import sympy as sp
-import concurrent.futures
 import os
 from pathlib import Path
 
 # --- F_k(q) Functions ---
+# small-q expansions included up to constant terms
 def F1_func(q):
     q_safe = np.where(q == 0, 1e-18, q)
     result = -1j/(2*q_safe) - np.exp(-1j*q_safe)/q_safe**2 - 1j*(1-np.exp(-1j*q_safe))/q_safe**3
-    return np.where(q == 0, 0.0 + 0.0j, result)
+    return np.where(q == 0, 1.0/3.0 - 0.0j, result)
 
 def F2_func(q):
     q_safe = np.where(q == 0, 1e-18, q)
     result = -(1+np.exp(-1j*q_safe))/q_safe**2 - 2j*(1-np.exp(-1j*q_safe))/q_safe**3
-    return np.where(q == 0, 0.0 + 0.0j, result)
+    return np.where(q == 0, 1.0/6.0 - 0.0j, result)
 
 def F2p_func(q):
     q_safe = np.where(q == 0, 1e-18, q)
@@ -34,7 +35,7 @@ def F2p_func(q):
             - 2*(-1 - exp_term)/q_safe**3 
             + 2.0*exp_term/q_safe**3 
             + 6.0*1j*one_minus_exp/q_safe**4)
-    return np.where(q == 0, 0.0 + 0.0j, result)
+    return np.where(q == 0, 0.0 - 1.0j/12.0, result)
 
 # --- Helpers ---
 def pol_tensor_6d(BETA3: NDArray, ALPHA3: NDArray, PSI3: NDArray) -> NDArray:
@@ -67,12 +68,12 @@ def q_field_6d(R3: NDArray, PHI3: NDArray, Z3: NDArray,
 
 # --- Core Routines ---
 
-def load_symbolic_kernels(path: str) -> tuple[tuple[dict, ...], tuple]:
+def load_kernels(path: str | os.PathLike) -> tuple[tuple[dict, ...], tuple[dict, ...]]:
     """
-    Loads pickled SymPy expressions and returns the symbolic maps
-    and the argument symbols.
+    Loads pickled SymPy expressions and lambdifies them using the
+    'numpy' backend with an explicit modules dictionary.
     """
-    print(f"Loading symbolic kernels from: {path}", flush=True)
+    print(f"Loading and compiling kernels from: {path}", flush=True)
     
     with open(path, "rb") as f:
         pack = pickle.load(f)
@@ -80,6 +81,16 @@ def load_symbolic_kernels(path: str) -> tuple[tuple[dict, ...], tuple]:
     var_names = pack["vars"]
     arg_symbols = sp.symbols(' '.join(var_names))
 
+    numpy_modules = {
+        'numpy': np,
+        'I': 1j,
+        'pi': np.pi
+    }
+
+    def lam(m):
+        return {k: sp.lambdify(arg_symbols, v, modules=[numpy_modules], cse=True)
+                for k, v in m.items()}
+    
     kernels_sym = (
         pack["JR_plus_exprs"],
         pack["JPHI_plus_exprs"],
@@ -89,21 +100,17 @@ def load_symbolic_kernels(path: str) -> tuple[tuple[dict, ...], tuple]:
         pack["JZ_cross_exprs"]
     )
     
-    print(f"Symbolic kernels loaded. Args: {var_names}", flush=True)
-    return kernels_sym, arg_symbols
-
-def compile_lambdify_map(symbolic_map: dict, arg_symbols: tuple) -> dict:
-    """
-    Compiles a map of symbolic expressions into lambdified functions.
-    """
-    numpy_modules = {
-        'numpy': np,
-        'I': 1j,
-        'pi': np.pi
-    }
+    kernels_lam = (
+        lam(pack["JR_plus_exprs"]),
+        lam(pack["JPHI_plus_exprs"]),
+        lam(pack["JZ_plus_exprs"]),
+        lam(pack["JR_cross_exprs"]),
+        lam(pack["JPHI_cross_exprs"]),
+        lam(pack["JZ_cross_exprs"])
+    )
     
-    return {k: sp.lambdify(arg_symbols, v, modules=[numpy_modules], cse=True)
-            for k, v in symbolic_map.items()}
+    print(f"Kernel compilation complete (NumPy backend). Args: {var_names}", flush=True)
+    return kernels_sym, kernels_lam
 
 def precalculate_fk_map(q: NDArray) -> dict:
     """
@@ -136,9 +143,6 @@ def eval_component_grid_6d(
     Nbeta, Nalpha, Npsi = nx.shape
     acc = np.zeros((Nr, Nphi, Nz, Nbeta, Nalpha, Npsi), dtype=c128)
     
-    total_spatial_points = Nr * Nphi * Nz
-    print(f"  Starting component evaluation ({len(coeff_map)} terms) over {total_spatial_points} spatial points...", flush=True)
-
     for i in range(Nr):
         for j in range(Nphi):
             for k in range(Nz):
@@ -179,61 +183,25 @@ def eval_component_grid_6d(
                 
                 acc[i, j, k, :, :, :] = acc_slice
 
-    print(f"  ... component evaluation finished for all {total_spatial_points} points.", flush=True)
     return acc
-
-# --- Parallelism Helpers ---
-
-def init_worker():
-    """Forces numpy's LinAlg backends to be single-threaded in worker processes."""
-    print(f"Initializing worker {os.getpid()}... setting threads to 1.", flush=True)
-    os.environ['OMP_NUM_THREADS'] = '1'
-    os.environ['MKL_NUM_THREADS'] = '1'
-    os.environ['OPENBLAS_NUM_THREADS'] = '1'
-    os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
-    os.environ['NUMEXPR_NUM_THREADS'] = '1'
-
-def eval_component_grid_6d_wrapper(args):
-    """
-    Simple wrapper to unpack args for ProcessPoolExecutor.submit
-    and return the result with its name.
-    
-    This function runs inside the worker process.
-    """
-    (coeff_map_sym, arg_symbols, e6, R3, PHI3, Z3, 
-     nx, ny, nz, q, wg_val, Fk_slice_map, name) = args
-    
-    # Compile the functions inside each worker
-    print(f"--- [Worker {os.getpid()}] Compiling component: {name} ---", flush=True)
-    coeff_map = compile_lambdify_map(coeff_map_sym, arg_symbols)
-    
-    print(f"--- [Worker {os.getpid()}] Starting evaluation: {name} ---", flush=True)
-    result = eval_component_grid_6d(
-        coeff_map, coeff_map_sym, e6, R3, PHI3, Z3, 
-        nx, ny, nz, q, wg_val, Fk_slice_map
-    )
-    
-    print(f"--- [Worker {os.getpid()}] Finished component: {name} ---", flush=True)
-    return (name, result)
 
 # --- Main Entry Point ---
 
 def compute_j_eff_6d(
-    path: str,
-    R3: NDArray, 
-    PHI3: NDArray, 
-    Z3: NDArray,
-    BETA3: NDArray, 
-    ALPHA3: NDArray, 
-    PSI3: NDArray,
+    R3: NDArray, PHI3: NDArray, Z3: NDArray,
+    BETA3: NDArray, ALPHA3: NDArray, PSI3: NDArray,
     wg: float,
+    kernel_path: str | os.PathLike,
     save_dir: str | os.PathLike | None = None
 ) -> tuple[NDArray, NDArray, NDArray, NDArray, NDArray, NDArray]:
     
-    # compiled functions cannot be passed to workers
-    # only load symbolic expressions and pass those to each worker process to be compiled
-    kernels_sym, arg_symbols = load_symbolic_kernels(path)
+    # # Load symbolic expressions
+    # kernels_sym, arg_symbols = load_symbolic_kernels(kernel_path)
+    # JR_plus_sym, JPHI_plus_sym, JZ_plus_sym, JR_cross_sym, JPHI_cross_sym, JZ_cross_sym = kernels_sym
+    
+    kernels_sym, kernels_lam = load_kernels(kernel_path)
     JR_plus_sym, JPHI_plus_sym, JZ_plus_sym, JR_cross_sym, JPHI_cross_sym, JZ_cross_sym = kernels_sym
+    JR_plus_lam, JPHI_plus_lam, JZ_plus_lam, JR_cross_lam, JPHI_cross_lam, JZ_cross_lam = kernels_lam
 
     print("Computing n-vectors, pol tensors, and q-field...", flush=True)
     nx, ny, nz = n_vec_6d(BETA3, ALPHA3)
@@ -243,30 +211,57 @@ def compute_j_eff_6d(
     
     Fk_slice_map = precalculate_fk_map(q)
 
-    tasks = [
-        (JR_plus_sym, arg_symbols, e6_p, R3, PHI3, Z3, nx, ny, nz, q, wg, Fk_slice_map, "Jr_p"),
-        (JPHI_plus_sym, arg_symbols, e6_p, R3, PHI3, Z3, nx, ny, nz, q, wg, Fk_slice_map, "Jphi_p"),
-        (JZ_plus_sym, arg_symbols, e6_p, R3, PHI3, Z3, nx, ny, nz, q, wg, Fk_slice_map, "Jz_p"),
-        (JR_cross_sym, arg_symbols, e6_c, R3, PHI3, Z3, nx, ny, nz, q, wg, Fk_slice_map, "Jr_c"),
-        (JPHI_cross_sym, arg_symbols, e6_c, R3, PHI3, Z3, nx, ny, nz, q, wg, Fk_slice_map, "Jphi_c"),
-        (JZ_cross_sym, arg_symbols, e6_c, R3, PHI3, Z3, nx, ny, nz, q, wg, Fk_slice_map, "Jz_c")
-    ]
-
     results = {}
-    print("--- Starting j_eff component computation in parallel (6 processes) ---", flush=True)
+    print("--- Starting j_eff component computation (serially) ---", flush=True)
+
+    try:
+        # --- Plus Polarization ---
+        print("--- Starting evaluation: Jr_p ---", flush=True)
+        results['Jr_p'] = eval_component_grid_6d(
+            JR_plus_lam, JR_plus_sym, e6_p, R3, PHI3, Z3, 
+            nx, ny, nz, q, wg, Fk_slice_map
+        )
+        print("--- Finished component: Jr_p ---", flush=True)
+
+        print("--- Starting evaluation: Jphi_p ---", flush=True)
+        results['Jphi_p'] = eval_component_grid_6d(
+            JPHI_plus_lam, JPHI_plus_sym, e6_p, R3, PHI3, Z3, 
+            nx, ny, nz, q, wg, Fk_slice_map
+        )
+        print("--- Finished component: Jphi_p ---", flush=True)
+        
+        print("--- Starting evaluation: Jz_p ---", flush=True)
+        results['Jz_p'] = eval_component_grid_6d(
+            JZ_plus_lam, JZ_plus_sym, e6_p, R3, PHI3, Z3, 
+            nx, ny, nz, q, wg, Fk_slice_map
+        )
+        print("--- Finished component: Jz_p ---", flush=True)
+
+        # --- Cross Polarization ---
+        print("--- Starting evaluation: Jr_c ---", flush=True)
+        results['Jr_c'] = eval_component_grid_6d(
+            JR_cross_lam, JR_cross_sym, e6_c, R3, PHI3, Z3, 
+            nx, ny, nz, q, wg, Fk_slice_map
+        )
+        print("--- Finished component: Jr_c ---", flush=True)
+
+        print("--- Starting evaluation: Jphi_c ---", flush=True)
+        results['Jphi_c'] = eval_component_grid_6d(
+            JPHI_cross_lam, JPHI_cross_sym, e6_c, R3, PHI3, Z3, 
+            nx, ny, nz, q, wg, Fk_slice_map
+        )
+        print("--- Finished component: Jphi_c ---", flush=True)
+
+        print("--- Starting evaluation: Jz_c ---", flush=True)
+        results['Jz_c'] = eval_component_grid_6d(
+            JZ_cross_lam, JZ_cross_sym, e6_c, R3, PHI3, Z3, 
+            nx, ny, nz, q, wg, Fk_slice_map
+        )
+        print("--- Finished component: Jz_c ---", flush=True)
     
-    with concurrent.futures.ProcessPoolExecutor(max_workers=6, initializer=init_worker) as executor:
-        
-        future_to_name = {executor.submit(eval_component_grid_6d_wrapper, task): task[-1] for task in tasks}
-        
-        for future in concurrent.futures.as_completed(future_to_name):
-            name = future_to_name[future]
-            try:
-                name, result_array = future.result()
-                results[name] = result_array
-            except Exception as exc:
-                print(f'{name} generated an exception: {exc}', flush=True)
-                raise exc
+    except Exception as exc:
+        print(f'A component generated an exception: {exc}', flush=True)
+        raise exc
 
     print("--- j_eff computation complete. ---", flush=True)
 
@@ -274,6 +269,10 @@ def compute_j_eff_6d(
     if save_dir is not None:
         data_dir = Path(save_dir)
         try:
+            # Need to get grid dimensions for filename
+            Nr, Nphi, Nz = R3.shape
+            Nbeta, Nalpha, Npsi = BETA3.shape
+            
             data_dir.mkdir(parents=True, exist_ok=True)            
             for name, array in results.items():
                 file_path = data_dir / f"{name}_{Nr},{Nphi},{Nz},{Nbeta},{Nalpha},{Npsi}.npy"
@@ -293,15 +292,15 @@ if __name__ == "__main__":
     
     print("Starting j_eff main execution...", flush=True)
     
-    # 1. Define spatial grid (e.g., 30x20x40)
-    Nr, Nphi, Nz = 30, 20, 10
+    # 1. Define spatial grid
+    Nr, Nphi, Nz = 25, 15, 5
     r_ax = np.linspace(0, 1, Nr)
     phi_ax = np.linspace(0, 2*np.pi, Nphi)
     z_ax = np.linspace(-1, 1, Nz)
     R3, PHI3, Z3 = np.meshgrid(r_ax, phi_ax, z_ax, indexing='ij')
 
-    # 2. Define angular grid (e.g., 10x10x5)
-    Nbeta, Nalpha, Npsi = 5, 4, 3
+    # 2. Define angular grid
+    Nbeta, Nalpha, Npsi = 20, 10, 1
     beta_ax = np.linspace(0, np.pi, Nbeta)
     alpha_ax = np.linspace(0, 2*np.pi, Nalpha)
     psi_ax = np.linspace(0, 2*np.pi, Npsi)
@@ -324,10 +323,10 @@ if __name__ == "__main__":
     # 4. Run the computation
     try:
         Jr_plus, Jphi_plus, Jz_plus, Jr_cross, Jphi_cross, Jz_cross = compute_j_eff_6d(
-            kernel_path,
             R3, PHI3, Z3,
             BETA3, ALPHA3, PSI3,
-            wg=wg_val,
+            wg_val,
+            kernel_path,
             save_dir=save_dir
         )
         
