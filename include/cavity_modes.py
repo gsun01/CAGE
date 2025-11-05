@@ -125,6 +125,9 @@ class CavityModeHelper:
         if sign not in {"+", "-"}:
             raise ValueError("sign must be '+' or '-'")
 
+        # 
+        _sign = "-" if (m == 0 and fam == "TM") else sign
+
         g = self._gamma(family, m, n)
         kz = self._kz(p, self.L)
         w = self._omega(g, kz)
@@ -142,13 +145,13 @@ class CavityModeHelper:
         m_over_r_Jm = _m_over_r_Jm(m, g, R3)
 
         if fam == "TM":
-            Er_TM = -kz_g * (smp if sign == "+" else cmp) * s_kz_z * Jm_p
-            Ephi_TM = -kz_g2 * (cmp if sign == "+" else -smp) * s_kz_z * m_over_r_Jm
-            Ez_TM = (smp if sign == "+" else cmp) * c_kz_z * Jm
+            Er_TM = -kz_g * (smp if _sign == "+" else cmp) * s_kz_z * Jm_p
+            Ephi_TM = -kz_g2 * (cmp if _sign == "+" else -smp) * s_kz_z * m_over_r_Jm
+            Ez_TM = (smp if _sign == "+" else cmp) * c_kz_z * Jm
             return asarr_c128(Er_TM), asarr_c128(Ephi_TM), asarr_c128(Ez_TM)
         else:   # TE
-            Er_TE = 1j * w_g2 * (cmp if sign == "+" else -smp) * s_kz_z * m_over_r_Jm
-            Ephi_TE = -1j * self.c * w / g * (smp if sign == "+" else cmp) * s_kz_z * Jm_p
+            Er_TE = 1j * w_g2 * (cmp if _sign == "+" else -smp) * s_kz_z * m_over_r_Jm
+            Ephi_TE = -1j * self.c * w / g * (smp if _sign == "+" else cmp) * s_kz_z * Jm_p
             Ez_TE = np.zeros_like(Er_TE, dtype=c128)
             return asarr_c128(Er_TE), asarr_c128(Ephi_TE), asarr_c128(Ez_TE)
 
