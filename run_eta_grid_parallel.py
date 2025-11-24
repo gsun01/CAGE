@@ -1,111 +1,161 @@
-# run_eta_simple.py
 from __future__ import annotations
 import os
 from itertools import product
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
+from pathlib import Path
+import traceback
 
-# Your modules
-from cavity_modes import CavityModeHelper       # expects CavityModeHelper(a, L).mode_functions(...)
-from antenna_pattern import antenna_pattern     # computes eta(beta, alpha, psi)
+from include.custom_types import *
+from include.cavity_modes import *
+from include.antenna_pattern import antenna_pattern
+from include.bessel import initialize_bessel_table
 
-def _compute_one(args):
-    (fam, sign, pol, m, n, p,
-     a, L, r, phi, z, beta, alpha, psi,
-     outdir, antenna_kwargs) = args
+f64 = np.float64 | float
+c128 = np.complex128 | float
 
-    # Build 3D mesh once per mode (cheap vs field eval; avoids shipping big arrays between processes)
-    R3, PHI3, Z3 = np.meshgrid(r, phi, z, indexing="ij")
+def _init_worker():
+    initialize_bessel_table(20, 20)
 
-    # Make mode functions once and (optionally) prewarm caches by evaluating on (R3,PHI3,Z3)
-    cav = CavityModeHelper(a, L)
-    Er_fn, Ephi_fn, Ez_fn = cav.mode_functions(fam, m, n, p, sign)
-    # Precompute once to fill any lru_cache / jitted paths
-    _ = Er_fn(R3, PHI3, Z3); _ = Ephi_fn(R3, PHI3, Z3); _ = Ez_fn(R3, PHI3, Z3)
-
-    # Compute eta on the 1D angle grids
-    kw = dict(antenna_kwargs or {})
+def _compute_one_mnp(args):
     try:
-        # Preferred: if antenna_pattern supports passing field callables explicitly
-        eta = antenna_pattern(
-            fam, m, n, p, sign, pol, a, L,
-            r=r, phi=phi, z=z,
-            beta=beta, alpha=alpha, psi=psi,
-            Er=Er_fn, Ephi=Ephi_fn, Ez=Ez_fn,
-            **kw
-        )
-    except TypeError:
-        # Fallback: older signature without explicit field callables
-        eta = antenna_pattern(
-            fam, m, n, p, sign, pol, a, L,
-            r=r, phi=phi, z=z,
-            beta=beta, alpha=alpha, psi=psi,
-            **kw
+        (fam, m, n, p,
+        a, L, r, phi, z, beta, alpha, psi,
+        kernel_path, eta_save_dir, j_eff_save_dir) = args
+
+        R3, PHI3, Z3 = np.meshgrid(r, phi, z, indexing="ij")
+        BETA3, ALPHA3, PSI3 = np.meshgrid(beta, alpha, psi, indexing="ij")
+
+        # compute cavity mode for fam,m,n,p
+        if fam == "TE" and (m == 0 or p == 0):
+            # print(f"Skipping unphysical TE_0n0 mode", flush=True)
+            return ("ok", "skipped", None)
+
+        Er3, Ephi3, Ez3 = E_mnp(a, L, R3, PHI3, Z3, fam, m, n, p)
+        w_mnp = omega_mnp(a, L, fam, m, n, p)
+        print(f"Computed cavity mode {fam}_{m}{n}{p} at ω={w_mnp:.3f}.", flush=True)
+        # do E^2 integral on (R3,PHI3,Z3) grid to get a scalar norm
+        Vcav = np.pi * a**2 * L
+        E2 = np.abs(Er3)**2 + np.abs(Ephi3)**2 + np.abs(Ez3)**2
+        # print(f"Is E field finite? {np.isfinite(E2).all()}", flush=True)
+        if not np.isfinite(E2).all():
+            raise ValueError(f"Non-finite fields at {fam}{m}{n}{p}.")
+        if np.max(E2) == 0.0:
+            print(f"All-zero fields at {fam}{m}{n}{p}.", flush=True)
+        norm = np.sqrt(Vcav * np.trapezoid(np.trapezoid(np.trapezoid(E2*R3, z, axis=2), phi, axis=1), r, axis=0))
+        print(f"Norm is {norm} for {fam}{m}{n}{p}. Computing eta...", flush=True)
+
+
+        eta_p_save_path = eta_save_dir / f"eta_{fam}_{m}{n}{p}_plus.npy"
+        eta_c_save_path = eta_save_dir / f"eta_{fam}_{m}{n}{p}_cross.npy"
+
+        eta_p, eta_c = antenna_pattern(
+            R3, PHI3, Z3,
+            BETA3, ALPHA3, PSI3,
+            Er3, Ephi3, Ez3, norm, w_mnp,
+            kernel_path,
+            eta_p_save_path,
+            eta_c_save_path,
+            j_eff_save_dir=j_eff_save_dir
         )
 
-    eta = np.asarray(eta)  # expected shape (Nb, Na, Npsi)
-    fname = f"eta_{fam}{sign}_pol{pol}_m{m}_n{n}_p{p}.npy"
-    fpath = os.path.join(outdir, fname)
-    np.save(fpath, eta)
-    return fpath, eta.shape
+        return ("ok", str(eta_save_dir), tuple(eta_p.shape))
+    except Exception as e:
+        print(f"Error in worker for args {args}: {e}", flush=True)
+        tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+        return ("err", tb, None)
 
 def run_eta_sweep(
-    r: np.ndarray, phi: np.ndarray, z: np.ndarray,
-    beta: np.ndarray, alpha: np.ndarray, psi: np.ndarray,
-    *, a: float, L: float,
-    m_vals, n_vals, p_vals,
-    families=("TE", "TM"), signs=("+", "-"), pols=("+", "x"),
-    outdir="eta_out", max_workers=None, antenna_kwargs=None
-):
-    os.makedirs(outdir, exist_ok=True)
-    # Save axes once (so you don’t duplicate in every file)
-    np.savez(os.path.join(outdir, "axes.npz"),
-             r=r, phi=phi, z=z, beta=beta, alpha=alpha, psi=psi)
+    r: NDArray, phi: NDArray, z: NDArray,
+    beta: NDArray, alpha: NDArray, psi: NDArray,
+    a: f64, L: f64, m_vals, n_vals, p_vals,
+    kernel_path: str | os.PathLike,
+    eta_save_dir: str | os.PathLike, 
+    j_eff_save_dir: str | os.PathLike, 
+    max_workers=8
+    ):
 
-    combos = list(product(families, signs, pols, m_vals, n_vals, p_vals))
+
+    families = ["TE", "TM"]
+    combos = list(product(families, m_vals, n_vals, p_vals))
     jobs = [
-        (fam, sign, pol, m, n, p,
+        (fam, m, n, p,
          a, L, r, phi, z, beta, alpha, psi,
-         outdir, antenna_kwargs)
-        for (fam, sign, pol, m, n, p) in combos
+         kernel_path, eta_save_dir, j_eff_save_dir)
+        for (fam, m, n, p) in combos
     ]
 
+    print(f"Jobs to do: {len(jobs)}", flush=True)
+
     if max_workers is None:
-        # Reasonable default; processes avoid GIL for NumPy/SciPy-heavy work
         import os as _os
         max_workers = max(1, (_os.cpu_count() or 1) - 0)
 
     results = []
-    with ProcessPoolExecutor(max_workers=max_workers) as ex:
-        futs = [ex.submit(_compute_one, j) for j in jobs]
+    with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_worker, initargs=()) as ex:
+        futs = [ex.submit(_compute_one_mnp, j) for j in jobs]
         for k, fut in enumerate(as_completed(futs), 1):
-            fpath, shape = fut.result()
-            print(f"[{k}/{len(futs)}] saved {os.path.basename(fpath)}  shape={shape}")
-            results.append((fpath, shape))
+            print(f"Working on job {k}/{len(futs)}...", flush=True)
+            status, payload, shape = fut.result()
+            if status == "ok":
+                print(f"[{k}/{len(futs)}] saved {Path(payload).name}  shape={shape}", flush=True)
+            else:
+                print(f"[{k}/{len(futs)}] WORKER ERROR:\n{payload}", flush=True)
+    
+    print("All done!", flush=True)
     return results
 
-# --- Example usage ---
 if __name__ == "__main__":
-    # Example axes (replace with your actual arrays)
-    a, L = 0.15, 0.50
-    r    = np.linspace(0.0, a, 200, endpoint=True)
-    phi  = np.linspace(0.0, 2*np.pi, 256, endpoint=False)
-    z    = np.linspace(-L/2, +L/2, 96, endpoint=True)
 
-    beta  = np.linspace(0.0, np.pi, 60)      # Nb
-    alpha = np.array([0.0])                  # Na=1
-    psi   = np.array([0.0])                  # Npsi=1
+#######################################################################
+######################### PARAMETERS ##################################
+#######################################################################
 
-    # Mode sweep
+    # cavity dimensions
+    a, L = 0.0206, 0.2032
+
+    # grid sizes
+    Nr, Nphi, Nz = 30, 90, 50
+    Nbeta, Nalpha, Npsi = 60, 1, 1
+    
+    # mode sweep parameters
     m_vals = [0, 1, 2]
     n_vals = [1, 2]
     p_vals = [0, 1, 2]
 
+    # output paths
+    datadir = Path("/data/sguotong/projects/CaGe/data")
+    kernel_path = datadir / "j_eff_expr" / "j_eff_kernels.pkl"
+    eta_save_dir = datadir / "etas"
+    j_eff_save_dir = datadir / "j_eff_arr"
+
+#######################################################################
+
+    datadir.mkdir(parents=True, exist_ok=True)
+    eta_save_dir.mkdir(parents=True, exist_ok=True)
+    eta_save_dir.mkdir(parents=True, exist_ok=True)
+
+    _init_worker()
+
+    r    = np.linspace(0.0, a, Nr, endpoint=True)
+    phi  = np.linspace(0.0, 2*np.pi, Nphi, endpoint=False)
+    z    = np.linspace(-L/2, +L/2, Nz, endpoint=True)
+
+    beta  = np.linspace(0.0, np.pi, Nbeta, endpoint=True)
+    alpha = np.linspace(0.0, 2*np.pi, Nalpha, endpoint=False)
+    psi   = np.linspace(0.0, 2*np.pi, Npsi, endpoint=False)
+
+    print(f"Running eta sweep for a={a}, L={L}", flush=True)
+
     run_eta_sweep(
-        r, phi, z, beta, alpha, psi,
-        a=a, L=L,
-        m_vals=m_vals, n_vals=n_vals, p_vals=p_vals,
-        families=("TE", "TM"), signs=("+", "-"), pols=("+", "x"),
-        outdir="eta_out",
-        antenna_kwargs=dict(normalize=True)  # or {}
+        r, phi, z,
+        beta, alpha, psi,
+        a, L, m_vals, n_vals, p_vals,
+        kernel_path,
+        eta_save_dir,
+        j_eff_save_dir,
+        max_workers=8
     )
+
+
+    

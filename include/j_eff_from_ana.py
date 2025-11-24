@@ -4,16 +4,19 @@ from pickled SymPy expressions using spatial-grid chunking
 for CPU cache efficiency.
 
 This version is single-threaded and computes all 6 components serially.
+q-field and Fk maps are calculated on-the-fly inside the spatial loop
+to avoid memory-intensive 6D arrays.
 """
 
 from __future__ import annotations
 __all__ = ["compute_j_eff_6d"]
+
 import numpy as np
-from .custom_types import *
 import pickle
 import sympy as sp
-import os
 from pathlib import Path
+
+from include.custom_types import *
 
 # --- F_k(q) Functions ---
 # small-q expansions included up to constant terms
@@ -51,7 +54,9 @@ def pol_tensor_6d(BETA3: NDArray, ALPHA3: NDArray, PSI3: NDArray) -> NDArray:
     eyy_p = c2p*Ayy + s2p*Byy; eyz_p = c2p*Ayz + s2p*Byz; ezz_p = c2p*Azz + s2p*Bzz
     exx_c = -s2p*Axx + c2p*Bxx; exy_c = -s2p*Axy + c2p*Bxy; exz_c = -s2p*Axz + c2p*Bxz
     eyy_c = -s2p*Ayy + c2p*Byy; eyz_c = -s2p*Ayz + c2p*Byz; ezz_c = -s2p*Azz + c2p*Bzz
-    return np.stack([[exx_p, exy_p, exz_p, eyy_p, eyz_p, ezz_p], [exx_c, exy_c, exz_c, eyy_c, eyz_c, ezz_c]], axis=0).astype(c128)
+    return np.stack([[exx_p, exy_p, exz_p, eyy_p, eyz_p, ezz_p], 
+                     [exx_c, exy_c, exz_c, eyy_c, eyz_c, ezz_c]], 
+                     axis=0, dtype=np.complex128)
 
 def n_vec_6d(BETA3: NDArray, ALPHA3: NDArray) -> tuple[NDArray, NDArray, NDArray]:
     sb, cb = np.sin(BETA3), np.cos(BETA3)
@@ -59,21 +64,31 @@ def n_vec_6d(BETA3: NDArray, ALPHA3: NDArray) -> tuple[NDArray, NDArray, NDArray
     nx = sb*ca; ny = sb*sa; nz = cb
     return nx, ny, nz
 
-def q_field_6d(R3: NDArray, PHI3: NDArray, Z3: NDArray, 
-               BETA3: NDArray, ALPHA3: NDArray, wg: float) -> NDArray:
-    R6   = R3[..., None, None, None]; PHI6 = PHI3[..., None, None, None]
-    Z6   = Z3[..., None, None, None]; ALPHA6 = ALPHA3[None, None, None, ...]
-    BETA6  = BETA3[None, None, None, ...]; sb, cb = np.sin(BETA6), np.cos(BETA6)
-    return wg * ( R6 * sb * np.cos(PHI6 - ALPHA6) + Z6 * cb )
+# --- New chunked helper functions ---
+def _q_field_3d_slice(r_val: float, phi_val: float, z_val: float, 
+                      BETA3: NDArray, ALPHA3: NDArray, wg: float) -> NDArray:
+    """Calculates a 3D angular slice of the q-field."""
+    sb, cb = np.sin(BETA3), np.cos(BETA3)
+    # r,phi,z are scalars; BETA3, ALPHA3 are 3D angular grids
+    return wg * ( r_val * sb * np.cos(phi_val - ALPHA3) + z_val * cb )
+
+def _precalculate_fk_map_3d_slice(q_slice: NDArray) -> dict:
+    """Calculates the Fk map for a 3D angular slice of q."""
+    Fk_slice_map = {}
+    q_slice_sq = q_slice * q_slice
+    F1_s = F1_func(q_slice); Fk_slice_map[0] = F1_s; Fk_slice_map[1] = q_slice * F1_s; del F1_s
+    F2_s = F2_func(q_slice); Fk_slice_map[2] = F2_s; Fk_slice_map[3] = q_slice * F2_s; del F2_s
+    F2p_s = F2p_func(q_slice); Fk_slice_map[4] = F2p_s; Fk_slice_map[5] = q_slice * F2p_s; Fk_slice_map[6] = q_slice_sq * F2p_s; del F2p_s, q_slice_sq
+    return Fk_slice_map
 
 # --- Core Routines ---
 
-def load_kernels(path: str | os.PathLike) -> tuple[tuple[dict, ...], tuple[dict, ...]]:
+def load_kernels(path: str | Path) -> tuple[tuple[dict, ...], tuple[dict, ...]]:
     """
     Loads pickled SymPy expressions and lambdifies them using the
     'numpy' backend with an explicit modules dictionary.
     """
-    print(f"Loading and compiling kernels from: {path}", flush=True)
+    # print(f"Loading and compiling kernels from: {path}", flush=True)
     
     with open(path, "rb") as f:
         pack = pickle.load(f)
@@ -109,21 +124,8 @@ def load_kernels(path: str | os.PathLike) -> tuple[tuple[dict, ...], tuple[dict,
         lam(pack["JZ_cross_exprs"])
     )
     
-    print(f"Kernel compilation complete (NumPy backend). Args: {var_names}", flush=True)
+    # print(f"Kernel compilation complete (NumPy backend). Args: {var_names}", flush=True)
     return kernels_sym, kernels_lam
-
-def precalculate_fk_map(q: NDArray) -> dict:
-    """
-    Calculates the Fk map once from the 6D q-field.
-    """
-    print("    Pre-calculating Fk values...", flush=True)
-    Fk_slice_map = {}
-    q_slice_sq = q * q
-    F1_s = F1_func(q); Fk_slice_map[0] = F1_s; Fk_slice_map[1] = q * F1_s; del F1_s
-    F2_s = F2_func(q); Fk_slice_map[2] = F2_s; Fk_slice_map[3] = q * F2_s; del F2_s
-    F2p_s = F2p_func(q); Fk_slice_map[4] = F2p_s; Fk_slice_map[5] = q * F2p_s; Fk_slice_map[6] = q_slice_sq * F2p_s; del F2p_s, q_slice_sq
-    print("    ...Fk pre-calculation complete.", flush=True)
-    return Fk_slice_map
 
 def eval_component_grid_6d(
     coeff_map: dict, 
@@ -131,9 +133,9 @@ def eval_component_grid_6d(
     e6: NDArray, 
     R3: NDArray, PHI3: NDArray, Z3: NDArray, 
     nx: NDArray, ny: NDArray, nz: NDArray, 
-    q: NDArray,
     wg_val: float,
-    Fk_slice_map: dict
+    BETA3: NDArray, 
+    ALPHA3: NDArray
 ) -> NDArray:
     """
     Evaluates one component (Jr, Jphi, or Jz) on the full 6D grid
@@ -149,7 +151,10 @@ def eval_component_grid_6d(
                 r_val = R3[i, j, k]
                 phi_val = PHI3[i, j, k]
                 z_val = Z3[i, j, k]
-                q_slice = q[i, j, k, :, :, :]
+
+                # Calculate q and Fk for this 3D slice ONLY
+                q_slice = _q_field_3d_slice(r_val, phi_val, z_val, BETA3, ALPHA3, wg_val)
+                Fk_map_3d = _precalculate_fk_map_3d_slice(q_slice)
                 
                 acc_slice = np.zeros((Nbeta, Nalpha, Npsi), dtype=c128)
                 
@@ -158,7 +163,8 @@ def eval_component_grid_6d(
                     try:
                         C_slice = func(r_val, phi_val, z_val, nx, ny, nz, q_slice, wg_val)
                         
-                        Fk_slice = Fk_slice_map[term_k][i, j, k, :, :, :]
+                        # Fk_map_3d is a 3D dict, not 6D
+                        Fk_slice = Fk_map_3d[term_k]
                         e6_slice = e6[term_j]
                         
                         term = C_slice * e6_slice * Fk_slice
@@ -182,82 +188,81 @@ def eval_component_grid_6d(
                         raise e
                 
                 acc[i, j, k, :, :, :] = acc_slice
+                
+                # Manually delete large 3D slices to help garbage collector
+                del q_slice, Fk_map_3d, acc_slice
 
     return acc
 
 # --- Main Entry Point ---
 
 def compute_j_eff_6d(
+    # beta_str: str,
     R3: NDArray, PHI3: NDArray, Z3: NDArray,
     BETA3: NDArray, ALPHA3: NDArray, PSI3: NDArray,
     wg: float,
-    kernel_path: str | os.PathLike,
-    save_dir: str | os.PathLike | None = None
+    kernel_path: str | Path,
+    save_dir: str | Path | None = None
 ) -> tuple[NDArray, NDArray, NDArray, NDArray, NDArray, NDArray]:
-    
-    # # Load symbolic expressions
-    # kernels_sym, arg_symbols = load_symbolic_kernels(kernel_path)
-    # JR_plus_sym, JPHI_plus_sym, JZ_plus_sym, JR_cross_sym, JPHI_cross_sym, JZ_cross_sym = kernels_sym
     
     kernels_sym, kernels_lam = load_kernels(kernel_path)
     JR_plus_sym, JPHI_plus_sym, JZ_plus_sym, JR_cross_sym, JPHI_cross_sym, JZ_cross_sym = kernels_sym
     JR_plus_lam, JPHI_plus_lam, JZ_plus_lam, JR_cross_lam, JPHI_cross_lam, JZ_cross_lam = kernels_lam
 
-    print("Computing n-vectors, pol tensors, and q-field...", flush=True)
+    # print("Computing n-vectors, pol tensors, and q-field...", flush=True)
     nx, ny, nz = n_vec_6d(BETA3, ALPHA3)
     e6 = pol_tensor_6d(BETA3, ALPHA3, PSI3)
     e6_p, e6_c = e6[0], e6[1]
-    q = q_field_6d(R3, PHI3, Z3, BETA3, ALPHA3, wg)
-    
-    Fk_slice_map = precalculate_fk_map(q)
+
+    # q and Fk_slice_map are now calculated inside eval_component_grid_6d
 
     results = {}
-    print("--- Starting j_eff component computation (serially) ---", flush=True)
+    print("--- Starting j_eff component computation ---", flush=True)
 
     try:
         # --- Plus Polarization ---
-        print("--- Starting evaluation: Jr_p ---", flush=True)
+        # print("--- Starting evaluation: Jr_p ---", flush=True)
         results['Jr_p'] = eval_component_grid_6d(
             JR_plus_lam, JR_plus_sym, e6_p, R3, PHI3, Z3, 
-            nx, ny, nz, q, wg, Fk_slice_map
+            nx, ny, nz, wg, BETA3, ALPHA3
         )
-        print("--- Finished component: Jr_p ---", flush=True)
+        # print("--- Finished component: Jr_p ---", flush=True)
 
-        print("--- Starting evaluation: Jphi_p ---", flush=True)
+        # print("--- Starting evaluation: Jphi_p ---", flush=True)
         results['Jphi_p'] = eval_component_grid_6d(
             JPHI_plus_lam, JPHI_plus_sym, e6_p, R3, PHI3, Z3, 
-            nx, ny, nz, q, wg, Fk_slice_map
+            nx, ny, nz, wg, BETA3, ALPHA3
         )
-        print("--- Finished component: Jphi_p ---", flush=True)
+        # print("--- Finished component: Jphi_p ---", flush=True)
         
-        print("--- Starting evaluation: Jz_p ---", flush=True)
+        # print("--- Starting evaluation: Jz_p ---", flush=True)
         results['Jz_p'] = eval_component_grid_6d(
             JZ_plus_lam, JZ_plus_sym, e6_p, R3, PHI3, Z3, 
-            nx, ny, nz, q, wg, Fk_slice_map
+            nx, ny, nz, wg, BETA3, ALPHA3
         )
-        print("--- Finished component: Jz_p ---", flush=True)
+        # print("--- Finished component: Jz_p ---", flush=True)
 
         # --- Cross Polarization ---
-        print("--- Starting evaluation: Jr_c ---", flush=True)
+        # print("--- Starting evaluation: Jr_c ---", flush=True)
         results['Jr_c'] = eval_component_grid_6d(
             JR_cross_lam, JR_cross_sym, e6_c, R3, PHI3, Z3, 
-            nx, ny, nz, q, wg, Fk_slice_map
+            nx, ny, nz, wg, BETA3, ALPHA3
         )
-        print("--- Finished component: Jr_c ---", flush=True)
+        # print("--- Finished component: Jr_c ---", flush=True)
 
-        print("--- Starting evaluation: Jphi_c ---", flush=True)
+        # print("--- Starting evaluation: Jphi_c ---", flush=True)
         results['Jphi_c'] = eval_component_grid_6d(
             JPHI_cross_lam, JPHI_cross_sym, e6_c, R3, PHI3, Z3, 
-            nx, ny, nz, q, wg, Fk_slice_map
+            nx, ny, nz, wg, BETA3, ALPHA3
         )
-        print("--- Finished component: Jphi_c ---", flush=True)
+        # print("--- Finished component: Jphi_c ---", flush=True)
 
-        print("--- Starting evaluation: Jz_c ---", flush=True)
+        # print("--- Starting evaluation: Jz_c ---", flush=True)
         results['Jz_c'] = eval_component_grid_6d(
             JZ_cross_lam, JZ_cross_sym, e6_c, R3, PHI3, Z3, 
-            nx, ny, nz, q, wg, Fk_slice_map
+            nx, ny, nz, wg, BETA3, ALPHA3
         )
-        print("--- Finished component: Jz_c ---", flush=True)
+        # print("--- Finished component: Jz_c ---", flush=True)
     
     except Exception as exc:
         print(f'A component generated an exception: {exc}', flush=True)
@@ -275,7 +280,9 @@ def compute_j_eff_6d(
             
             data_dir.mkdir(parents=True, exist_ok=True)            
             for name, array in results.items():
-                file_path = data_dir / f"{name}_{Nr},{Nphi},{Nz},{Nbeta},{Nalpha},{Npsi}.npy"
+                # file_path = data_dir / f"{name}_{Nr},{Nphi},{Nz},{Nbeta},{Nalpha},{Npsi}.npy"
+                # test filename ##########################
+                file_path = data_dir / f"{name}_{beta_str}.npy"
                 np.save(file_path, array)
                 print(f"    Saved {name} to {file_path.name}", flush=True)
             print(f"--- Saved results to: {data_dir.resolve()} ---", flush=True)
@@ -293,17 +300,23 @@ if __name__ == "__main__":
     print("Starting j_eff main execution...", flush=True)
     
     # 1. Define spatial grid
-    Nr, Nphi, Nz = 25, 15, 5
-    r_ax = np.linspace(0, 1, Nr)
+    Nr, Nphi, Nz = 30, 90, 50
+    a, L = 0.0206, 0.2032
+
+    r_ax = np.linspace(0, a, Nr)
     phi_ax = np.linspace(0, 2*np.pi, Nphi)
-    z_ax = np.linspace(-1, 1, Nz)
+    z_ax = np.linspace(-L/2, L/2, Nz)
     R3, PHI3, Z3 = np.meshgrid(r_ax, phi_ax, z_ax, indexing='ij')
 
     # 2. Define angular grid
-    Nbeta, Nalpha, Npsi = 20, 10, 1
-    beta_ax = np.linspace(0, np.pi, Nbeta)
-    alpha_ax = np.linspace(0, 2*np.pi, Nalpha)
-    psi_ax = np.linspace(0, 2*np.pi, Npsi)
+    Nbeta, Nalpha, Npsi = 1, 1, 1
+    # beta_ax = np.linspace(0, np.pi, Nbeta)
+    # alpha_ax = np.linspace(0, 2*np.pi, Nalpha)
+    # psi_ax = np.linspace(0, 2*np.pi, Npsi)
+    beta_str = "0"
+    beta_ax = np.array([0.0])
+    alpha_ax = np.array([0.0])
+    psi_ax = np.array([0.0])
     BETA3, ALPHA3, PSI3 = np.meshgrid(beta_ax, alpha_ax, psi_ax, indexing='ij')
 
     # 3. Define other params
@@ -312,17 +325,18 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         kernel_path = sys.argv[1]
     else:
-        kernel_path = "/grad/sguotong/projects/CaGe/data/j_eff_expr/j_eff_kernels.pkl"
+        kernel_path = "/data/sguotong/projects/CaGe/data/j_eff_expr/j_eff_kernels.pkl"
     
     print(f"Using kernel file: {kernel_path}", flush=True)
 
-    save_dir = Path("/grad/sguotong/projects/CaGe/data/j_eff_arr")
+    save_dir = Path("/data/sguotong/projects/CaGe/data/j_eff_test")
     print(f"Output will be saved to: {save_dir.resolve()}", flush=True)
 
 
     # 4. Run the computation
     try:
         Jr_plus, Jphi_plus, Jz_plus, Jr_cross, Jphi_cross, Jz_cross = compute_j_eff_6d(
+            # beta_str,
             R3, PHI3, Z3,
             BETA3, ALPHA3, PSI3,
             wg_val,
@@ -339,4 +353,3 @@ if __name__ == "__main__":
         print(f"Error: Kernel file not found at {kernel_path}", flush=True)
     except Exception as e:
         print(f"An error occurred: {e}", flush=True)
-
