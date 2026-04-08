@@ -1,0 +1,12 @@
+name: cage
+channels:
+  - conda-forge
+dependencies:
+  - ipykernel
+  - matplotlib
+  - numba
+  - numpy
+  - scipy
+  - sympy
+
+prefix: "/nfshome/sguotong/micromamba/envs/cage"
