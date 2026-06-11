@@ -6,6 +6,7 @@ c = 299_792_458.0
 mu0 = 4*np.pi*1e-7
 Lcav = 1.00    # m
 Rcav = 1.00     # m
+Vcav = np.pi*Rcav*Rcav*Lcav     # m^3
 # Rcav = 0.21    # m
 # Rcav = 0.155    # m
 
@@ -17,7 +18,7 @@ def make_cylinder_grid_uniform(R=Rcav, L=Lcav, Nr=40, Nphi=128, Nz=48):
     r = (np.arange(Nr) + 0.5) * dr
     phi = np.arange(Nphi) * dphi
     z = -0.5*L + (np.arange(Nz) + 0.5) * dz
-
+ 
     Rg, Pg, Zg = np.meshgrid(r, phi, z, indexing="ij")
 
     x = Rg * np.cos(Pg)
@@ -355,9 +356,86 @@ def form_factors(mode, m, n, p,
         etaps = np.append(etaps, eta_plus)
         etacs = np.append(etacs, eta_cross)
 
-    return etaps, etacs, betas
+    return etaps, etacs, betas, omega_g
 
-def plot_form_factors(etaps, etacs, betas, mode_str):
+def form_factor_one_beta(mode, m, n, p, beta, mode_fields,
+                R=Rcav, L=Lcav, grid=None):
+    '''
+    Computes the overlap factor eta, as defined in
+    Berlin et al. (2022), eq. 22, for one beta angle.
+    Use in parallel loops.
+    '''
+    if grid is None:
+        # grid = make_cylinder_grid_quad(R=R, L=L)
+        grid = make_cylinder_grid_uniform(R=R, L=L)
+    x, y, z, r, phi, weights = grid
+    z_cap = z + 0.5*L            # Strangely, Berlin's cavity modes are defined with the origin at the bottom cap, not the center of the cylinder
+
+    (Ex_plus, Ey_plus, Ez_plus, 
+        Ex_minus, Ey_minus, Ez_minus, omega_g,
+        denom_plus, denom_minus) = mode_fields
+    # Ex_plus, Ey_plus, Ez_plus, omega_g = E_mnp(r, phi, z_cap, m, n, p, mode)
+    # Ex_minus, Ey_minus, Ez_minus, omega_g = E_mnp(r, phi, z_cap, m, n, p, mode, sign='-')
+    # denom_plus = np.sum(weights) * np.sum(weights * (np.abs(Ex_plus)**2 + np.abs(Ey_plus)**2 + np.abs(Ez_plus)**2))
+    # denom_minus = np.sum(weights) * np.sum(weights * (np.abs(Ex_minus)**2 + np.abs(Ey_minus)**2 + np.abs(Ez_minus)**2))
+
+    alpha, psi = np.pi/2.0, 0.0
+    # etaps, etacs = np.array([]), np.array([])
+
+    Jxp, Jyp, Jzp, Jxc, Jyc, Jzc, nn = normalized_effective_current(x, y, z, omega_g, beta, alpha)
+    overlap_p_plus = np.sum(weights * (np.conjugate(Ex_plus) * Jxp + np.conjugate(Ey_plus) * Jyp + np.conjugate(Ez_plus) * Jzp))
+    overlap_c_plus = np.sum(weights * (np.conjugate(Ex_plus) * Jxc + np.conjugate(Ey_plus) * Jyc + np.conjugate(Ez_plus) * Jzc))
+
+    if m == 0:
+        overlap_p_minus, overlap_c_minus = 0.0, 0.0
+    else:
+        overlap_p_minus = np.sum(weights * (np.conjugate(Ex_minus) * Jxp + np.conjugate(Ey_minus) * Jyp + np.conjugate(Ez_minus) * Jzp))
+        overlap_c_minus = np.sum(weights * (np.conjugate(Ex_minus) * Jxc + np.conjugate(Ey_minus) * Jyc + np.conjugate(Ez_minus) * Jzc))
+
+    eta_plus_sq = np.abs(overlap_p_plus)**2 / denom_plus + np.abs(overlap_p_minus)**2 / denom_minus
+    eta_cross_sq = np.abs(overlap_c_plus)**2 / denom_plus + np.abs(overlap_c_minus)**2 / denom_minus
+    eta_plus = np.sqrt(eta_plus_sq)
+    eta_cross = np.sqrt(eta_cross_sq)
+
+    return eta_plus, eta_cross
+
+from joblib import Parallel, delayed
+from threadpoolctl import threadpool_limits
+import os
+
+def parallel_beta_scan(mode, m, n, p, betas, R=Rcav, L=Lcav, n_jobs=None, backend='threading'):
+
+    if n_jobs is None:
+        n_jobs = max(1, os.cpu_count() - 1)
+
+    # construct cavity modes
+    grid = make_cylinder_grid_uniform(R=R, L=L)
+    x, y, z, r, phi, weights = grid
+    z_cap = z + 0.5*L
+    Ex_plus, Ey_plus, Ez_plus, omega_g = E_mnp(r, phi, z_cap, m, n, p, mode)
+    Ex_minus, Ey_minus, Ez_minus, omega_g = E_mnp(r, phi, z_cap, m, n, p, mode, sign='-')
+    denom_plus = np.sum(weights) * np.sum(weights * (np.abs(Ex_plus)**2 + np.abs(Ey_plus)**2 + np.abs(Ez_plus)**2))
+    denom_minus = np.sum(weights) * np.sum(weights * (np.abs(Ex_minus)**2 + np.abs(Ey_minus)**2 + np.abs(Ez_minus)**2))
+    mode_fields = (Ex_plus, Ey_plus, Ez_plus, 
+        Ex_minus, Ey_minus, Ez_minus, omega_g,
+        denom_plus, denom_minus)
+
+    # Prevent NumPy/BLAS from spawning too many internal threads per worker.
+    with threadpool_limits(limits=1):
+        results = Parallel(
+            n_jobs=n_jobs,
+            backend=backend,
+            batch_size=1,
+            verbose=10,
+        )(
+            delayed(form_factor_one_beta)(mode, m, n, p, beta, mode_fields, grid=grid)
+            for beta in betas
+        )
+
+    etaps, etacs = zip(*results)
+    return np.asarray(etaps), np.asarray(etacs), omega_g
+
+def plot_form_factors(etaps, etacs, betas, mode_str, omega_g):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8), subplot_kw={"projection": "polar"})
     for ax in (ax1, ax2):
         ax.set_theta_zero_location("E")
@@ -373,21 +451,42 @@ def plot_form_factors(etaps, etacs, betas, mode_str):
     fig.tight_layout()
     fig.savefig(f'{mode_str}.png', dpi=600, bbox_inches="tight", pad_inches=0.03)
 
+def plot_CAPP_CGW(etaps, etacs, betas, mode_str, omega_g):
+    # Change later to translate Berlin \eta to CAPP's C_GW
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8), subplot_kw={"projection": "polar"})
+    for ax in (ax1, ax2):
+        ax.set_theta_zero_location("E")
+        ax.set_theta_direction(1)
+        ax.set_rlabel_position(90)
+        ax.set_thetagrids(np.arange(0, 360, 90))
+
+    ax1.plot(betas, etaps, lw=1.5)
+    ax1.set_title(f'{mode_str}, ' + r'$\eta_+$')
+
+    ax2.plot(betas, etacs, lw=1.5)
+    ax2.set_title(f'{mode_str}, ' + r'$C_\times$')
+    fig.tight_layout()
+    fig.savefig(f'{mode_str}.png', dpi=600, bbox_inches="tight", pad_inches=0.03)
 
 def main():
+    import time
+
     # TE modes: p >= 1
-    mode, m, n, p = 'TM', 0, 3, 0
+    mode, m, n, p = 'TM', 0, 1, 0
     mode_str = mode + str(m) + str(n) + str(p)
 
-    import time
+    betas = np.linspace(0, 2*np.pi, 361)
     t1 = time.time()
-    etaps, etacs, betas = form_factors(mode, m, n, p)
+    etaps, etacs, omega_g = parallel_beta_scan(mode, m, n, p, betas, n_jobs=8)
     t2 = time.time()
-    print(f'Computed overlap factors for {mode}{m}{n}{p} in {t2 - t1} seconds.')
+    print(f'Computed in parallel overlap factors for {mode}{m}{n}{p} in {t2 - t1} seconds.')
 
-    plot_form_factors(etaps, etacs, betas, mode_str)
-    t3 = time.time()
-    print(f'Plotted overlap factors for {mode}{m}{n}{p} in {t3 - t2} seconds.')
+    # t1 = time.time()
+    # etaps, etacs, betas, omega_g = form_factors(mode, m, n, p)
+    # t2 = time.time()
+    # print(f'Computed overlap factors for {mode}{m}{n}{p} in {t2 - t1} seconds.')
+
+    plot_form_factors(etaps, etacs, betas, mode_str+'_para', omega_g)
     return
 
 if __name__ == '__main__':
